@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-project-validation"
+version = "0.1.0"
+description = "mydbg: record, replay and check what a Python project (for example one an AI wrote) actually does"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Xiaokai Wu"}]
+
+[project.optional-dependencies]
+previews = ["pandas", "numpy"]
+test = ["pytest"]
+
+[project.scripts]
+mydbg = "mydbg:_main"
+
+[tool.setuptools]
+py-modules = ["mydbg"]
