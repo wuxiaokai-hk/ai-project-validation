@@ -128,14 +128,19 @@ replaced by "not saved" in the saved call.
 ### Reading the report
 
 - Each function call is one row, such as `#22 add_features(df=DataFrame(100, 3), lags=3) → DataFrame(100, 7)`,
-  with its file, line and run time. Click to open or close it. Calls made inside it are nested.
-- **INPUTS** lists the arguments as they were when the call started. Globals the function read are tagged
-  *global*. Click a DataFrame to see its first rows and column types.
-- **Code lines** run in order. Under each line, the variables it changed are shown in amber.
-- **OUTPUT** shows the return value, or the error in red. The replay line has a copy button that copies the
-  `load_call` line for that call.
-- **Toolbar:** Expand all, Collapse all, Hide code lines (calls with inputs and outputs only), and a box to
-  find a function by name.
+  with its file, line and run time. Click to open or close it.
+- An opened call shows, in this order, so you can judge it without reading its code:
+  1. **INPUTS**: the arguments as they were when the call started. Globals the function read are tagged
+     *global*. Click a DataFrame to see its first rows and column types.
+  2. **OUTPUT**: the return value, or the error in red. The replay line has a copy button that copies the
+     `load_call` line for that call.
+  3. **CALLS MADE**: the calls it made, in order, each one openable the same way.
+  4. **Code, line by line** (folded): open it only when you need it. Under each line, the variables it
+     changed are shown in amber; a `↳ #42 fit()` line marks where a call happened and jumps to it.
+- **Search** (press `/`): type part of a function name, a call number (`#123`), a file name, or a value
+  from the inputs or output (`lags=3`, `FCPI`). Several words must all match. The list shows every match;
+  use ↑/↓ and Enter, or click, to open that call wherever it is nested.
+- **Toolbar:** Expand all, Collapse all, and Hide code lines (calls with inputs and outputs only).
 - If the script crashes, the report is still written. A red banner shows the error, and the calls that led
   to it have red borders.
 
@@ -212,6 +217,7 @@ result changed.
 | A function shows "… 80 more calls not recorded" | Only the first 20 calls per function are kept. Use `--max-calls 0` to keep all of them, but watch the disk space |
 | `check()` says DIFFERENT although nothing was edited | The function depends on something not saved: files it reads, command-line arguments, unseeded random numbers, today's date |
 | An input shows `<not saved: …>` | The object can't be saved, such as a database connection or an open file. Pass it yourself: `c.rerun(conn=my_conn)` |
+| An input that is a function shows `<not saved: function …<lambda>…>` (e.g. a callback `fn`) | Lambdas and nested functions can't be saved with standard pickle. `rerun()` and `check()` still work: the function returns the result(s) it returned during the recording, instead of running again. To rerun it for real, pass your own (`c.rerun(fn=...)`), or `pip install cloudpickle` and record again |
 | "nested function - cannot be re-imported" | Functions defined inside another function can be recorded but not replayed. Move it to the top level of a module to replay it |
 | A helper module doesn't appear in the report | It sits outside the script's folder. Add `--root` with the folder that contains all the project's code |
 | `load_call(22)` can't find the call | Run it from the folder with `trace_calls`, add `folder=`, or paste the full line from the report's copy button |
