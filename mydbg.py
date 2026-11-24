@@ -155,10 +155,12 @@ def _value_html(v, rows):
 
 # ---------------------------------------------------------- saving values
 class Unsaved:
-    """Placeholder for a value that could not be pickled (open file, DB connection, ...)."""
+    """Placeholder for a value that could not be pickled (open file, DB connection, lambda, ...).
+    For a function, `code` = (file, first line, qualname), so replay can stand in for it."""
 
-    def __init__(self, text):
+    def __init__(self, text, code=None):
         self.text = text
+        self.code = code
 
     def __repr__(self):
         return f"<not saved: {self.text}>"
@@ -183,7 +185,18 @@ def _dump_value(v):
     try:
         return pickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
     except Exception as e:
-        return pickle.dumps(Unsaved(f"{_short(v, 80)} ({type(e).__name__})"), protocol=pickle.HIGHEST_PROTOCOL)
+        err = e
+    try:                                   # lambdas / nested functions: cloudpickle can save them, if installed
+        import cloudpickle
+        return cloudpickle.dumps(v, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        pass
+    code = getattr(v, "__code__", None) or getattr(getattr(v, "__func__", None), "__code__", None)
+    ref = None
+    if code is not None:
+        ref = (os.path.abspath(code.co_filename), code.co_firstlineno, getattr(code, "co_qualname", code.co_name))
+    what = f"function {ref[2]} ({os.path.basename(ref[0])}:{ref[1]})" if ref else _short(v, 80)
+    return pickle.dumps(Unsaved(f"{what} - {type(err).__name__}", code=ref), protocol=pickle.HIGHEST_PROTOCOL)
 
 
 _GLOBAL_CACHE = {}
@@ -435,6 +448,8 @@ class Recorder:
                 node.last_line = item
                 node.nlines += 1
         elif event == "exception":
+            if issubclass(arg[0], (StopIteration, StopAsyncIteration, GeneratorExit)):
+                return self.local_trace        # normal end of a loop / generator, not an error
             node.pending_exc = arg
             node.items.append(("exc", f"{arg[0].__name__}: {_short(arg[1], 200)}"))
         elif event == "return":
@@ -442,6 +457,8 @@ class Recorder:
             if not self.calls_only:
                 self._diff(node, frame)
             pe = node.pending_exc
+            if pe is not None and arg is not None:
+                pe = node.pending_exc = None             # it returned a value, so the error was handled
             if pe is not None and issubclass(pe[0], SystemExit) and getattr(pe[1], "code", None) in (None, 0):
                 pe = node.pending_exc = None             # normal sys.exit(0) of a CLI, not an error
                 node.items.pop() if node.items and node.items[-1][0] == "exc" else None
@@ -483,8 +500,11 @@ class Recorder:
             title = f'{tag}<span class="fn">{e(n.name)}</span>({args}) <span class="arrow">→</span> {res}'
         cls = "call err" if n.raised else "call"
         is_open = " open" if depth == 0 else ""
-        out.append(f'<details class="{cls}"{is_open}><summary>{title}'
+        anchor = f' id="c{n.cid}"' if n.cid else ""
+        out.append(f'<details class="{cls}"{anchor}{is_open}><summary>{title}'
                    f'<span class="meta">{e(self._rel(n.file))}:{n.lineno} · {dur}</span></summary><div class="body">')
+
+        # 1) what went in and what came out -- first, so you don't have to read the whole function
         if n.args or n.globs:
             out.append('<table class="io"><tr><th colspan=2>INPUTS</th></tr>')
             for k, _, h in n.args:
@@ -492,20 +512,6 @@ class Recorder:
             for k, h in n.globs:
                 out.append(f'<tr><td class=k>{e(k)} <span class="gl">global</span></td><td>{h}</td></tr>')
             out.append("</table>")
-        for it in n.items:
-            kind = it[0]
-            if kind == "call":
-                self._render(it[1], out, depth + 1)
-            elif kind == "line":
-                _, no, src, ch = it
-                chs = "".join(f'<div class="chg">{e(k)} = {e(v)}</div>' for k, v in ch)
-                out.append(f'<div class="ln"><span class="no">{no}</span><code>{e(src)}</code>{chs}</div>')
-            elif kind == "exc":
-                out.append(f'<div class="exc">⚠ {e(it[1])}</div>')
-        if n.skipped_lines:
-            out.append('<div class="note">… later lines not shown (--max-lines)</div>')
-        for fn_name, c in n.skipped_calls.items():
-            out.append(f'<div class="note">… {c:,} more calls to {e(fn_name)}() not recorded (--max-calls)</div>')
         if n.name != "<module>":
             out.append('<table class="io out"><tr><th colspan=2>OUTPUT</th></tr>')
             if n.raised:
@@ -517,6 +523,39 @@ class Recorder:
                 out.append(f'<tr><td class=k>replay</td><td><code class="rp">{e(snippet)}</code>'
                            f'<button class="cp" onclick="cp(this)">copy</button></td></tr>')
             out.append("</table>")
+
+        # 2) the calls it made, in order
+        calls = [it[1] for it in n.items if it[0] == "call"]
+        lines = [it for it in n.items if it[0] == "line"]
+        excs = [it for it in n.items if it[0] == "exc"]
+        if calls or n.skipped_calls:
+            out.append(f'<div class="sec">CALLS MADE ({len(calls)})</div>')
+            for c in calls:
+                self._render(c, out, depth + 1)
+            for fn_name, c in n.skipped_calls.items():
+                out.append(f'<div class="note">… {c:,} more calls to {e(fn_name)}() not recorded (--max-calls)</div>')
+        if excs and not lines:
+            for it in excs:
+                out.append(f'<div class="exc">⚠ {e(it[1])}</div>')
+
+        # 3) the code, line by line -- folded; open it only when you need it
+        if lines:
+            out.append(f'<details class="code"><summary>Code, line by line ({len(lines)} lines)</summary>')
+            for it in n.items:
+                kind = it[0]
+                if kind == "call":
+                    c = it[1]
+                    out.append(f'<div class="callref"><a href="#c{c.cid}" onclick="return go({c.cid})">'
+                               f'↳ #{c.cid} {e(c.name)}()</a> <span class="mut">(shown above)</span></div>')
+                elif kind == "line":
+                    _, no, src, ch = it
+                    chs = "".join(f'<div class="chg">{e(k)} = {e(v)}</div>' for k, v in ch)
+                    out.append(f'<div class="ln"><span class="no">{no}</span><code>{e(src)}</code>{chs}</div>')
+                elif kind == "exc":
+                    out.append(f'<div class="exc">⚠ {e(it[1])}</div>')
+            if n.skipped_lines:
+                out.append('<div class="note">… later lines not shown (--max-lines)</div>')
+            out.append("</details>")
         out.append("</div></details>")
 
     def write_html(self, path, elapsed, crash=None):
@@ -567,22 +606,61 @@ details.val>summary{{cursor:pointer}} details.val>summary::marker{{color:var(--m
 table.df{{border-collapse:collapse;margin:4px 0;font-size:12px}} table.df th,table.df td{{border:1px solid var(--line);padding:2px 6px;text-align:right}}
 .dtypes{{color:var(--mut);font-size:11px}}
 .crash{{background:var(--err);color:#fff;padding:8px 12px;border-radius:6px;margin:8px 0}}
-body.compact .ln,body.compact .note,body.compact .exc{{display:none}}
+body.compact details.code{{display:none}}
 .hit>summary{{outline:2px solid var(--chg)}}
+.flash>summary{{animation:fl 2s ease-out}} @keyframes fl{{0%{{background:var(--chg);color:var(--bg)}}100%{{background:transparent}}}}
+.sec{{font-size:10px;letter-spacing:.08em;color:var(--mut);margin:8px 0 2px 2px}}
+details.code{{margin:6px 0 4px;border:1px dashed var(--line);border-radius:6px;padding:2px 8px}}
+details.code>summary{{cursor:pointer;color:var(--mut);font-size:12px;padding:2px 0}}
+.callref{{margin:1px 0 1px 52px;font-size:12px}} .callref a{{color:var(--fn);text-decoration:none}} .mut{{color:var(--mut)}}
+.sw{{position:relative;display:inline-block;vertical-align:top}}
+#q{{width:340px}}
+#res{{display:none;position:absolute;left:0;top:30px;width:min(760px,92vw);max-height:60vh;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:8px;box-shadow:0 8px 24px rgba(0,0,0,.18);z-index:10}}
+#res .r{{padding:5px 10px;cursor:pointer;font-family:ui-monospace,Menlo,monospace;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-bottom:1px solid var(--line)}}
+#res .r.sel,#res .r:hover{{background:var(--hl)}} #res .r b{{color:var(--fn)}} #res .r .m{{color:var(--mut);margin-left:8px}}
+#res .hd{{padding:4px 10px;font-size:11px;color:var(--mut)}}
 </style></head><body>
 <header><h1>Trace · {title}</h1>
 <div class="sub">recorded {when} · {elapsed} s (with tracing overhead) · {ncalls} calls saved to {data} · click a call to open it</div>
 <button onclick="setAll(true)">Expand all</button><button onclick="setAll(false)">Collapse all</button>
 <button id="cb" onclick="toggleCompact()">Hide code lines (calls only)</button>
-<input id="q" placeholder="find function…" oninput="find(this.value)">
+<span class="sw"><input id="q" placeholder="search: function, #123, file, value…  (press / )" autocomplete="off"
+ oninput="search(this.value)" onkeydown="keys(event)" onfocus="search(this.value)"><div id="res"></div></span>
 </header>{crash}
 <main>{body}</main>
 <script>
 function setAll(o){{document.querySelectorAll('details.call').forEach(d=>d.open=o)}}
 function toggleCompact(){{const c=document.body.classList.toggle('compact');document.getElementById('cb').textContent=c?'Show code lines':'Hide code lines (calls only)'}}
-function find(q){{document.querySelectorAll('.hit').forEach(d=>d.classList.remove('hit'));if(!q)return;let first=null;
- document.querySelectorAll('details.call').forEach(d=>{{const f=d.querySelector(':scope>summary .fn');if(f&&f.textContent.toLowerCase().includes(q.toLowerCase())){{d.classList.add('hit');first=first||d;let p=d.parentElement;while(p){{if(p.tagName==='DETAILS')p.open=true;p=p.parentElement}}}}}});
- if(first)first.scrollIntoView({{block:'center'}})}}
+let IDX=null,SEL=0,HITS=[];
+function buildIdx(){{IDX=[];document.querySelectorAll('details.call').forEach((d,i)=>{{const sm=d.querySelector(':scope>summary');if(!sm)return;
+ const fn=(sm.querySelector('.fn')||{{}}).textContent||'';const cid=(sm.querySelector('.cid')||{{}}).textContent||'';const meta=(sm.querySelector('.meta')||{{}}).textContent||'';
+ const txt=sm.textContent;IDX.push({{d,fn:fn.toLowerCase(),fnRaw:fn,cid:cid.replace('#',''),meta,txt,low:(txt+' '+meta).toLowerCase()}})}})}}
+function esc(t){{return t.replace(/[&<>]/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;'}})[c])}}
+function search(q){{if(!IDX)buildIdx();const box=document.getElementById('res');q=q.trim().toLowerCase();
+ document.querySelectorAll('.hit').forEach(d=>d.classList.remove('hit'));
+ if(!q){{box.style.display='none';HITS=[];return}}
+ let hits;
+ if(/^#?\\d+$/.test(q)){{const n=q.replace('#','');hits=IDX.filter(x=>x.cid===n)}}
+ else{{const toks=q.split(/\\s+/);hits=IDX.filter(x=>toks.every(t=>x.low.includes(t)));
+  const score=x=>x.fn===toks[0]?0:x.fn.startsWith(toks[0])?1:x.fn.includes(toks[0])?2:3;
+  hits.sort((a,b)=>score(a)-score(b))}}
+ HITS=hits;SEL=0;
+ let h='<div class="hd">'+hits.length+' match'+(hits.length===1?'':'es')+(hits.length>200?' (first 200 shown)':'')+' · ↑↓ to move, Enter to open'+'</div>';
+ hits.slice(0,200).forEach((x,i)=>{{let t=esc(x.txt.replace(x.meta,'').trim());if(x.fnRaw)t=t.replace(esc(x.fnRaw),'<b>'+esc(x.fnRaw)+'</b>');
+  h+='<div class="r'+(i===0?' sel':'')+'" onmousedown="pick('+i+')">'+t+'<span class="m">'+esc(x.meta)+'</span></div>'}});
+ if(!hits.length)h='<div class="hd">no match</div>';
+ box.innerHTML=h;box.style.display='block';hits.forEach(x=>x.d.classList.add('hit'))}}
+function keys(ev){{const box=document.getElementById('res');const rs=box.querySelectorAll('.r');
+ if(ev.key==='ArrowDown'||ev.key==='ArrowUp'){{ev.preventDefault();if(!rs.length)return;rs[SEL].classList.remove('sel');
+  SEL=(SEL+(ev.key==='ArrowDown'?1:-1)+rs.length)%rs.length;rs[SEL].classList.add('sel');rs[SEL].scrollIntoView({{block:'nearest'}})}}
+ else if(ev.key==='Enter'){{if(HITS.length)pick(SEL)}}
+ else if(ev.key==='Escape'){{box.style.display='none';ev.target.blur()}}}}
+function show(d){{let p=d.parentElement;while(p){{if(p.tagName==='DETAILS')p.open=true;p=p.parentElement}}d.open=true;
+ d.scrollIntoView({{block:'start'}});window.scrollBy(0,-110);d.classList.remove('flash');void d.offsetWidth;d.classList.add('flash')}}
+function pick(i){{const x=HITS[i];if(!x)return;document.getElementById('res').style.display='none';show(x.d)}}
+function go(cid){{const d=document.getElementById('c'+cid);if(d)show(d);return false}}
+document.addEventListener('keydown',ev=>{{if(ev.key==='/'&&document.activeElement.tagName!=='INPUT'){{ev.preventDefault();document.getElementById('q').focus()}}}});
+document.addEventListener('click',ev=>{{if(!ev.target.closest('.sw'))document.getElementById('res').style.display='none'}});
 function cp(b){{const t=b.previousElementSibling.textContent;const done=()=>{{b.textContent='copied';setTimeout(()=>b.textContent='copy',1200)}};
  if(navigator.clipboard)navigator.clipboard.writeText(t).then(done,()=>sel(b));else sel(b)}}
 function sel(b){{const r=document.createRange();r.selectNodeContents(b.previousElementSibling);const s=getSelection();s.removeAllRanges();s.addRange(r)}}
@@ -651,9 +729,19 @@ class Call:
                 sys.path.insert(0, p)
         self.id, self.name, self.qualname = m["id"], m["name"], m["qualname"]
         self.file, self.line, self.raised, self.ms = m["file"], m["line"], m["raised"], m["ms"]
-        self.inputs = self._load("inputs")
-        self.globals = self._load("globals")
-        self.output = None if d["output"] is None else self._load("output")["output"]
+        self._cache = {}
+
+    def _cached(self, key):
+        if key not in self._cache:
+            if key == "output":
+                self._cache[key] = None if self._raw["output"] is None else self._load("output")["output"]
+            else:
+                self._cache[key] = self._load(key)
+        return self._cache[key]
+
+    inputs = property(lambda self: self._cached("inputs"), doc="Inputs as they were when the call started")
+    globals = property(lambda self: self._cached("globals"), doc="Global variables the function read")
+    output = property(lambda self: self._cached("output"), doc="The value it returned")
 
     def _obj(self, h):
         with open(os.path.join(os.path.dirname(self.path), "objects", h + ".pkl"), "rb") as f:
@@ -696,10 +784,62 @@ class Call:
             args += list(inp.get(names[i], ())); i += 1
         if m["varkw"]:
             kwargs.update(inp.get(names[i], {}))
-        bad = [k for k, v in list(zip(names, args)) + list(kwargs.items()) if isinstance(v, Unsaved)]
-        if bad:
-            raise RuntimeError(f"input(s) {bad} could not be saved; pass them yourself: rerun({bad[0]}=...)")
+        # An input that could not be saved: if it is a function that was called during the recording
+        # (a callback, e.g. cache.run(step, fn=lambda: ...)), stand in for it with its recorded results.
+        named = list(zip(names, range(len(args))))
+        for k, i in named:
+            if isinstance(args[i], Unsaved):
+                args[i] = self._stand_in(k, args[i])
+        for k in list(kwargs):
+            if isinstance(kwargs[k], Unsaved):
+                kwargs[k] = self._stand_in(k, kwargs[k])
         return args, kwargs
+
+    def _descendant_calls(self):
+        """Saved calls made inside this call (at any depth), in order, as (id, pkl path)."""
+        folder = os.path.dirname(self.path)
+        with open(os.path.join(folder, "index.csv"), newline="", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        kids = {}
+        for r in rows:
+            kids.setdefault(r["parent"], []).append(r)
+        out, todo = [], [str(self.id)]
+        while todo:
+            for r in kids.get(todo.pop(), []):
+                todo.append(r["id"])
+                if r["pkl"]:
+                    out.append((int(r["id"]), os.path.join(folder, r["pkl"])))
+        return sorted(out)
+
+    def _stand_in(self, name, u):
+        code = getattr(u, "code", None)
+        hint = (f"Pass it yourself, e.g. c.rerun({name}=...)"
+                + ("; or `pip install cloudpickle` and record again, so it can be saved" if code else ""))
+        if not code:
+            raise RuntimeError(f"input '{name}' could not be saved ({u.text}). {hint}")
+        recorded = []
+        for cid, path in self._descendant_calls():
+            with open(path, "rb") as f:
+                meta = pickle.load(f)["meta"]
+            if os.path.abspath(meta["file"]) == code[0] and meta["line"] == code[1]:
+                recorded.append(path)
+        if not recorded:
+            raise RuntimeError(f"input '{name}' could not be saved ({u.text}) and was not called during "
+                               f"the recording, so there is nothing to replay. {hint}")
+        print(f"[mydbg] input '{name}' ({u.text}) could not be saved; it will return its "
+              f"{len(recorded)} recorded result(s) instead of running. {hint}.", file=sys.stderr)
+        queue = list(recorded)
+
+        def stand_in(*a, **k):
+            if not queue:
+                raise RuntimeError(f"'{name}' was called more often than during the recording "
+                                   f"({len(recorded)} time(s)); pass a real function: rerun({name}=...)")
+            c = Call(queue.pop(0))
+            if c.raised:
+                raise RuntimeError(f"recorded call #{c.id} of '{name}' raised {c.raised}")
+            return c._load("output")["output"]
+        stand_in.__name__ = f"recorded_{name}"
+        return stand_in
 
     def _with_globals(self, fn, run, override=None):
         g = fn.__globals__

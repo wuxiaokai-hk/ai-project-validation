@@ -67,3 +67,49 @@ def test_crash_still_writes_report(tmp_path):
     assert r.returncode != 0
     html = (tmp_path / "trace.html").read_text(encoding="utf-8")
     assert "ZeroDivisionError" in html
+
+
+PIPE = '''
+class StepCache:
+    def run(self, step, fn):
+        return fn()
+
+def evaluate(x, lgd):
+    return x * lgd
+
+def main():
+    data = 100.0
+    return StepCache().run("evaluate", lambda: evaluate(data, 0.45))
+
+main()
+'''
+
+
+def _record(tmp_path, env=None):
+    (tmp_path / "pipe.py").write_text(PIPE)
+    r = subprocess.run([sys.executable, MYDBG, "record", "pipe.py"], cwd=tmp_path,
+                       capture_output=True, text=True, env=env)
+    assert r.returncode == 0, r.stderr
+
+
+def test_unsaved_callback_is_replayed_from_its_recorded_result(tmp_path, monkeypatch):
+    # Simulate an environment without cloudpickle: the lambda input cannot be saved.
+    (tmp_path / "cloudpickle.py").write_text("raise ImportError('not installed')\n")
+    env = dict(os.environ, PYTHONPATH=str(tmp_path))
+    _record(tmp_path, env)
+    monkeypatch.syspath_prepend(ROOT)
+    sys.modules.pop("mydbg", None)
+    from mydbg import Unsaved, load_call
+    c = load_call(2, folder=str(tmp_path / "trace_calls"))      # StepCache.run(step, fn)
+    assert isinstance(c.inputs["fn"], Unsaved)
+    assert c.rerun() == 45.0                # stand-in returns the lambda's recorded result
+    assert c.check()
+    assert c.rerun(fn=lambda: 1.0) == 1.0   # or pass your own function
+
+
+def test_report_shows_output_before_code_and_has_search(tmp_path):
+    _record(tmp_path)
+    html = (tmp_path / "trace.html").read_text(encoding="utf-8")
+    block = html[html.index('id="c2"'):]
+    assert block.index("OUTPUT") < block.index("CALLS MADE") < block.index("Code, line by line")
+    assert 'id="q"' in html and "function search(" in html
